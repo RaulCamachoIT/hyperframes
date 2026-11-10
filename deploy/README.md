@@ -85,6 +85,23 @@ Necesita **espacio en `/tmp`**: con los 512 Mi iniciales el CLI aborta con
 «Low disk space» antes de capturar. El manifiesto monta un emptyDir de 4 Gi en
 `/tmp` y 1 Gi en `/dev/shm`. El MP4 se escribe en `/data` (emptyDir de 2 Gi).
 
+## Riesgos conocidos (dev)
+
+- **El studio no autentica su API.** Comprobado en T-364: sin credenciales,
+  `GET /api/projects` lista el proyecto y `GET /api/projects/project/files/...`
+  lee ficheros; `POST /api/projects/:id/render` permite lanzar renders (CPU).
+  El pod está endurecido, pero eso no protege la app. Antes de exponerlo fuera
+  de dev hace falta SSO/proxy (oauth2-proxy, Keycloak) o una allowlist de IP en
+  el Ingress. No se publica en pre/pro.
+- **Miniaturas del listado de composiciones en 500.** `studio-server` compone
+  la URL de captura como `http://<host>/api/...`
+  (`packages/studio-server/src/routes/thumbnail.ts:189`) y el puerto 80 no está
+  publicado en el clúster (el ingress solo publica 443). La tarjeta muestra
+  «Preview unavailable»; la edición, la previsualización y el render no se ven
+  afectados. Se corrige en el upstream o con un proxy interno.
+- **Chrome sin GPU**: el render usa `software gpu` (WebGL no disponible en el
+  pod). Es correcto para el demo; un proyecto con shaders pesados irá más lento.
+
 ## Qué NO soporta este contenedor
 
 - **Autenticación**: el studio no tiene auth propia y su API permite leer y

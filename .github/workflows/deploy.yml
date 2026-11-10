@@ -44,6 +44,8 @@ env:
   # Límite de CPU del pod (limits.cpu) que el preflight de cuota reserva para
   # el pod de surge. Debe coincidir con k8s/hyperframes.yaml.
   POD_CPU: "1000m"
+  # requests.memory del pod (consume la cuota requests.memory del namespace).
+  POD_MEM: "512Mi"
 
 jobs:
   build-push-deploy:
@@ -67,6 +69,7 @@ jobs:
           [ -n "${{ vars.REGISTRY_HOST }}" ] || miss="$miss var:REGISTRY_HOST"
           [ -n "${{ vars.BASE_DOMAIN }}" ] || miss="$miss var:BASE_DOMAIN"
           [ -n "${{ vars.TLS_ISSUER }}" ] || miss="$miss var:TLS_ISSUER"
+          [ -n "${{ vars.KUBE_SERVER }}" ] || miss="$miss var:KUBE_SERVER"
           if [ -n "$miss" ]; then
             echo "::error::Falta configuración en GitHub:$miss"
             echo "Pulsa Configurar CI en la pestaña Git del panel (proyecto hyperframes)."
@@ -103,7 +106,11 @@ jobs:
           esperado="${{ vars.KUBE_SERVER }}"
           echo "KUBE_CONFIG server=$server"
           echo "vars.KUBE_SERVER=$esperado"
-          if [ -n "$esperado" ] && [ "$server" != "$esperado" ]; then
+          if [ -z "$esperado" ]; then
+            echo "::error::vars.KUBE_SERVER está vacía: no se puede verificar el clúster destino (L-116). Falla cerrado."
+            exit 1
+          fi
+          if [ "$server" != "$esperado" ]; then
             echo "::error::KUBE_CONFIG apunta a $server y KUBE_SERVER declara $esperado; regenera KUBE_CONFIG (L-116)"
             exit 1
           fi
@@ -112,7 +119,7 @@ jobs:
       # L-079/L-084: un rolling update necesita el pod de surge. Si la cuota
       # de limits.cpu no tiene hueco, el apply acaba en FailedCreate tras el
       # deadline; se aborta antes con el número exacto.
-      - name: Preflight de cuota (limits.cpu)
+      - name: Preflight de cuota (limits.cpu y requests.memory)
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
           NS: ${{ steps.env.outputs.ns }}
@@ -135,6 +142,21 @@ jobs:
             echo "::error::sin hueco para el pod de surge: usado ${usado_m}m + ${pod_m}m > tope ${tope_m}m (L-079). Libera CPU o sube la cuota temporalmente."
             exit 1
           fi
+          # T-364: el mismo riesgo existe con requests.memory (iba al 78 % de la
+          # cuota). Se compara en bytes para admitir Ki/Mi/Gi.
+          used_mem="$(kubectl -n "$NS" get resourcequota proyecto -o jsonpath='{.status.used.requests\.memory}')"
+          hard_mem="$(kubectl -n "$NS" get resourcequota proyecto -o jsonpath='{.status.hard.requests\.memory}')"
+          if [ -z "$used_mem" ] || [ -z "$hard_mem" ]; then
+            echo "::warning::cuota sin requests.memory (usado='$used_mem' tope='$hard_mem'); se omite"
+            exit 0
+          fi
+          bytes() { awk -v v="$1" 'BEGIN{ if (v ~ /Ki$/) {sub(/Ki$/,"",v); printf "%.0f", v*1024} else if (v ~ /Mi$/) {sub(/Mi$/,"",v); printf "%.0f", v*1048576} else if (v ~ /Gi$/) {sub(/Gi$/,"",v); printf "%.0f", v*1073741824} else {printf "%.0f", v} }'; }
+          usado_b="$(bytes "$used_mem")"; tope_b="$(bytes "$hard_mem")"; pod_b="$(bytes "$POD_MEM")"
+          echo "requests.memory usado=${used_mem} (${usado_b}) tope=${hard_mem} (${tope_b}) pod=${POD_MEM} (${pod_b})"
+          if [ $((usado_b + pod_b)) -gt "$tope_b" ]; then
+            echo "::error::sin hueco de memoria para el pod de surge: usado ${usado_b} + ${pod_b} > tope ${tope_b} (T-364). Libera memoria o sube la cuota."
+            exit 1
+          fi
 
       - uses: docker/setup-buildx-action@v3
 
@@ -151,6 +173,7 @@ jobs:
           context: .
           file: Dockerfile
           push: true
+          platforms: linux/amd64
           tags: ${{ env.APP_IMAGE }}:dev-${{ github.sha }}
 
       - name: Deploy a dev
@@ -181,6 +204,8 @@ jobs:
       - name: Smoke HTTPS (200 y TLS válido)
         env:
           HOST: ${{ steps.env.outputs.host }}
+          NS: ${{ steps.env.outputs.ns }}
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
         run: |
           set -uo pipefail
           ok=0; code=""
@@ -192,9 +217,18 @@ jobs:
           done
           if [ "$ok" != "1" ]; then
             echo "::error::https://$HOST no responde 200 con el studio"
-            kubectl -n "${{ steps.env.outputs.ns }}" get pods -l app=hyperframes -o wide || true
+            kubectl -n "$NS" get pods -l app=hyperframes -o wide || true
+            # No dejar la versión roja sirviendo: se vuelve a la revisión anterior.
+            echo "::warning::rollback a la revisión anterior de hyperframes"
+            kubectl -n "$NS" rollout undo deployment/hyperframes || true
             exit 1
           fi
           echo "==> OK: https://$HOST HTTP 200 ($(wc -c </tmp/hf-smoke.html) B)"
           echo | openssl s_client -servername "$HOST" -connect "$HOST:443" 2>/dev/null \
             | openssl x509 -noout -issuer -subject -dates || true
+
+      # El runner es compartido: el kubeconfig con credenciales del SA no debe
+      # sobrevivir al job (T-364).
+      - name: Limpiar kubeconfig efímero
+        if: always()
+        run: rm -f "${{ runner.temp }}/kubeconfig"
