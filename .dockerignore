@@ -1,0 +1,21 @@
+# Contexto de build de la imagen de HyperFrames Studio (T-364).
+# Sin esto el contexto son ~2,7 GB (node_modules + dist + .git) y el build
+# del runner se queda sin disco/tiempo.
+.git
+.github
+.husky
+.worktrees
+node_modules
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+coverage
+**/coverage
+docs/images
+docs
+videos
+.playwright-mcp
+**/.DS_Store
+**/.env
+**/.env.*
+!.env.example

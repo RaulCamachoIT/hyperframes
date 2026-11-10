@@ -1,0 +1,146 @@
+apiVersion: panel/v1
+id: hyperframes
+label: Hyperframes
+description: >-
+  HyperFrames Studio como servicio del panel (T-364): imagen con bun 1.4.4,
+  chrome-headless-shell y ffmpeg; studio en https://hyperframes.dev.itadaptativa.es.
+icon: FolderKanban
+roles:
+  viewer: hyperframes-viewer
+  admin: hyperframes-admin
+repo: https://github.com/RaulCamachoIT/hyperframes.git
+environments:
+  # Solo dev está aprovisionado. El studio no trae auth propia: pre/pro
+  # exigen SSO/proxy antes de promover (deploy/README.md).
+  - dev
+apps:
+  - name: hyperframes
+    namespace: dev
+    kind: Deployment
+    port: 3002
+    url: https://hyperframes.dev.itadaptativa.es
+    health:
+      path: /
+      port: 3002
+      expect: 200
+databases: []
+backups:
+  enabled: false
+  schedule: ""
+  retentionDays: 30
+  include: []
+checks: []
+modules:
+  - id: overview
+    label: Resumen
+    icon: Gauge
+    enabled: true
+    config: {}
+  - id: deploys
+    label: Deploys
+    icon: Rocket
+    enabled: true
+    config: {}
+  - id: git
+    label: Git
+    icon: GitBranch
+    enabled: true
+    config: {}
+  - id: health
+    label: Salud
+    icon: Activity
+    enabled: true
+    config: {}
+  - id: tasks
+    label: Tareas
+    icon: ClipboardList
+    enabled: true
+    config: {}
+  - id: backups
+    label: Backups
+    icon: HardDrive
+    enabled: true
+    config: {}
+  - id: database
+    label: Base de datos
+    icon: Database
+    enabled: true
+    config: {}
+  - id: docs
+    label: Docs
+    icon: BookOpen
+    enabled: true
+    config: {}
+  - id: files
+    label: Archivos
+    icon: Folder
+    enabled: true
+    config: {}
+  - id: users
+    label: Usuarios
+    icon: Users
+    enabled: true
+    config: {}
+  - id: settings
+    label: Configuración
+    icon: Settings
+    enabled: true
+    config: {}
+links:
+  - label: GitHub
+    url: https://github.com/RaulCamachoIT/hyperframes
+  - label: Studio dev
+    url: https://hyperframes.dev.itadaptativa.es
+custom: []
+layout:
+  - id: overview
+    x: 0
+    "y": 0
+    w: 12
+    h: 4
+  - id: deploys
+    x: 0
+    "y": 4
+    w: 8
+    h: 4
+  - id: git
+    x: 8
+    "y": 4
+    w: 4
+    h: 4
+  - id: health
+    x: 0
+    "y": 8
+    w: 6
+    h: 4
+  - id: tasks
+    x: 6
+    "y": 8
+    w: 6
+    h: 4
+  - id: backups
+    x: 0
+    "y": 12
+    w: 6
+    h: 4
+  - id: database
+    x: 6
+    "y": 12
+    w: 6
+    h: 4
+  - id: docs
+    x: 0
+    "y": 16
+    w: 6
+    h: 4
+  - id: files
+    x: 0
+    "y": 20
+    w: 6
+    h: 4
+  - id: users
+    x: 6
+    "y": 20
+    w: 6
+    h: 4
+settings: {}

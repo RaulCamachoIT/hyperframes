@@ -1,0 +1,154 @@
+# HyperFrames Studio en K3s (T-364): Deployment + Service + Ingress.
+# Servicio único: `hyperframes preview` sirve el studio (UI + API) en :3002.
+#
+# Vars de envsubst (las exporta el workflow):
+#   NS, HYPERFRAMES_IMAGE, HYPERFRAMES_HOST, TLS_ISSUER
+#
+# Seguridad: el studio NO trae autenticación propia y su API permite leer y
+# escribir los ficheros del proyecto. Por eso este manifiesto solo se aplica
+# en `dev` y el pod va endurecido: usuario 10001, rootfs read-only, sin token
+# de ServiceAccount, seccomp RuntimeDefault, capabilities drop ALL y volúmenes
+# emptyDir acotados. Antes de promover a pre/pro hace falta SSO/proxy de auth
+# (ver deploy/README.md).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hyperframes
+  namespace: ${NS}
+  labels:
+    app: hyperframes
+    cp.itadaptativa.es/project: hyperframes
+spec:
+  replicas: 1
+  # Estado local (proyecto + historial) en un emptyDir: una réplica, sin HPA.
+  revisionHistoryLimit: 3
+  minReadySeconds: 10
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # T-199/L-020: no apagar el studio bueno antes de que el nuevo esté Ready.
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: hyperframes
+  template:
+    metadata:
+      labels:
+        app: hyperframes
+        cp.itadaptativa.es/project: hyperframes
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      imagePullSecrets:
+        - name: regcred
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: studio
+          image: ${HYPERFRAMES_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3002
+          env:
+            - name: PORT
+              value: "3002"
+            - name: NODE_ENV
+              value: production
+            - name: HYPERFRAMES_PROJECT_DIR
+              value: /data/project
+            - name: HYPERFRAMES_NO_TELEMETRY
+              value: "1"
+            # El entrypoint ya lo fija, se repite aquí para que el contrato del
+            # pod no dependa de la imagen.
+            - name: HYPERFRAMES_PREVIEW_HOST
+              value: 0.0.0.0
+          resources:
+            # En reposo el studio ronda 330 MB (bun + chrome-headless-shell,
+            # T-363). Un render es intensivo: 1 CPU / 1,5 Gi de techo y cola
+            # implícita (1 réplica). requests bajos para no agotar la cuota dev.
+            requests: { cpu: 150m, memory: 512Mi }
+            limits: { cpu: "1", memory: 1536Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          # Primer arranque: copia del demo + carga del studio (~10-30 s).
+          startupProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 48
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: data
+          emptyDir: { sizeLimit: 2Gi }
+        - name: tmp
+          emptyDir: { sizeLimit: 512Mi }
+        # Chrome usa /dev/shm; el default de 64 MB hace fallar capturas grandes.
+        - name: dshm
+          emptyDir: { medium: Memory, sizeLimit: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hyperframes
+  namespace: ${NS}
+  labels:
+    app: hyperframes
+    cp.itadaptativa.es/project: hyperframes
+spec:
+  selector: { app: hyperframes }
+  ports:
+    - name: http
+      port: 3002
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hyperframes
+  namespace: ${NS}
+  labels:
+    cp.itadaptativa.es/project: hyperframes
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    # L-113/L-005: DNS-01 (el puerto 80 no está publicado) y sin Certificate
+    # explícito: el ingress-shim lo emite y evita dos objetos compitiendo.
+    cert-manager.io/cluster-issuer: ${TLS_ISSUER}
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: ["${HYPERFRAMES_HOST}"]
+      secretName: ${HYPERFRAMES_HOST}-tls
+  rules:
+    - host: ${HYPERFRAMES_HOST}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: hyperframes, port: { name: http } }

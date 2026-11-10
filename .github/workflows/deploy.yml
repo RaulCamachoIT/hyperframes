@@ -1,0 +1,200 @@
+# hyperframes — build + push + deploy a dev (servicio único).
+#
+# Este proyecto trabaja en `main` (config git-hyperframes, T-360), no en `dev`.
+# Por eso main → namespace dev / host hyperframes.dev.<base>. pre/pro NO están
+# aprovisionados: se despliegan cuando existan ns, auth y cuota (ver
+# deploy/README.md). No se publica el studio fuera de dev sin SSO/proxy.
+#
+# Requiere en el repo (Settings → Secrets/Variables; lo configura el botón
+# "Configurar CI" del panel):
+#   secrets: REGISTRY_USER, REGISTRY_PASS, KUBE_CONFIG (SA ci-deployer)
+#   vars: REGISTRY_HOST, BASE_DOMAIN, TLS_ISSUER, KUBE_SERVER
+# Prerrequisito: regcred en el ns dev (ya existe en este clúster).
+#
+# Runner: self-hosted del panel (L-074). El repo necesita su runner; se
+# provisiona con POST /api/projects/hyperframes/git/setup-ci {installRunner:true}.
+
+name: hyperframes-deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Entorno (solo dev está aprovisionado)"
+        required: true
+        default: "dev"
+        type: choice
+        options: [dev]
+
+# L-036: no cancelar un deploy en curso; la siguiente run espera su turno.
+concurrency:
+  group: hyperframes-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  APP_IMAGE: ${{ vars.REGISTRY_HOST }}/ita-hyperframes
+  # Límite de CPU del pod (limits.cpu) que el preflight de cuota reserva para
+  # el pod de surge. Debe coincidir con k8s/hyperframes.yaml.
+  POD_CPU: "1000m"
+
+jobs:
+  build-push-deploy:
+    name: Imagen y deploy a dev
+    runs-on: [self-hosted, panel]
+    timeout-minutes: 60
+    env:
+      # Secretos por env, nunca interpolados dentro de `run:`.
+      REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+      REGISTRY_PASS: ${{ secrets.REGISTRY_PASS }}
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight (secretos y vars)
+        run: |
+          miss=""
+          [ -n "$REGISTRY_USER" ] || miss="$miss secret:REGISTRY_USER"
+          [ -n "$REGISTRY_PASS" ] || miss="$miss secret:REGISTRY_PASS"
+          [ -n "$KUBE_CONFIG" ] || miss="$miss secret:KUBE_CONFIG"
+          [ -n "${{ vars.REGISTRY_HOST }}" ] || miss="$miss var:REGISTRY_HOST"
+          [ -n "${{ vars.BASE_DOMAIN }}" ] || miss="$miss var:BASE_DOMAIN"
+          [ -n "${{ vars.TLS_ISSUER }}" ] || miss="$miss var:TLS_ISSUER"
+          if [ -n "$miss" ]; then
+            echo "::error::Falta configuración en GitHub:$miss"
+            echo "Pulsa Configurar CI en la pestaña Git del panel (proyecto hyperframes)."
+            exit 1
+          fi
+          echo "Preflight OK."
+
+      - name: Entorno (main → dev)
+        id: env
+        run: |
+          E=dev
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then E="${{ inputs.target }}"; fi
+          if [ "$E" != "dev" ]; then
+            echo "::error::el entorno '$E' no está aprovisionado; solo dev (ver deploy/README.md)"
+            exit 1
+          fi
+          echo "name=dev" >> "$GITHUB_OUTPUT"
+          echo "ns=dev" >> "$GITHUB_OUTPUT"
+          echo "host=hyperframes.dev.${{ vars.BASE_DOMAIN }}" >> "$GITHUB_OUTPUT"
+
+      - name: Kubeconfig efímero (no en ~/.kube del runner)
+        run: |
+          printf '%s' "$KUBE_CONFIG" > "$RUNNER_TEMP/kubeconfig"
+          chmod 600 "$RUNNER_TEMP/kubeconfig"
+
+      # L-116/L-117: el deploy es verde en el clúster equivocado si el
+      # KUBE_CONFIG apunta a otro API. Falla cerrado contra la var publicada.
+      - name: Guard del clúster (KUBE_SERVER)
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        run: |
+          set -euo pipefail
+          server="$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+          esperado="${{ vars.KUBE_SERVER }}"
+          echo "KUBE_CONFIG server=$server"
+          echo "vars.KUBE_SERVER=$esperado"
+          if [ -n "$esperado" ] && [ "$server" != "$esperado" ]; then
+            echo "::error::KUBE_CONFIG apunta a $server y KUBE_SERVER declara $esperado; regenera KUBE_CONFIG (L-116)"
+            exit 1
+          fi
+          kubectl version --client=true | head -n1
+
+      # L-079/L-084: un rolling update necesita el pod de surge. Si la cuota
+      # de limits.cpu no tiene hueco, el apply acaba en FailedCreate tras el
+      # deadline; se aborta antes con el número exacto.
+      - name: Preflight de cuota (limits.cpu)
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          NS: ${{ steps.env.outputs.ns }}
+        run: |
+          set -euo pipefail
+          if ! kubectl -n "$NS" get resourcequota proyecto >/dev/null 2>&1; then
+            echo "::warning::sin resourcequota/proyecto en $NS; se omite el preflight"
+            exit 0
+          fi
+          used="$(kubectl -n "$NS" get resourcequota proyecto -o jsonpath='{.status.used.limits\.cpu}')"
+          hard="$(kubectl -n "$NS" get resourcequota proyecto -o jsonpath='{.status.hard.limits\.cpu}')"
+          if [ -z "$used" ] || [ -z "$hard" ]; then
+            echo "::warning::cuota sin status.used/status.hard (usado='$used' tope='$hard'); se omite"
+            exit 0
+          fi
+          milli() { awk -v v="$1" 'BEGIN{ if (v ~ /m$/) { sub(/m$/,"",v); printf "%d", v } else { printf "%d", v*1000 } }'; }
+          usado_m="$(milli "$used")"; tope_m="$(milli "$hard")"; pod_m="$(milli "${POD_CPU}")"
+          echo "limits.cpu usado=${used} (${usado_m}m) tope=${hard} (${tope_m}m) pod=${POD_CPU} (${pod_m}m)"
+          if [ $((usado_m + pod_m)) -gt "$tope_m" ]; then
+            echo "::error::sin hueco para el pod de surge: usado ${usado_m}m + ${pod_m}m > tope ${tope_m}m (L-079). Libera CPU o sube la cuota temporalmente."
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.REGISTRY_HOST }}
+          username: ${{ env.REGISTRY_USER }}
+          password: ${{ env.REGISTRY_PASS }}
+
+      # L-020: tag inmutable dev-<sha>; nunca :latest.
+      - name: Build + push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ env.APP_IMAGE }}:dev-${{ github.sha }}
+
+      - name: Deploy a dev
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          NS: ${{ steps.env.outputs.ns }}
+          HOST: ${{ steps.env.outputs.host }}
+          HYPERFRAMES_IMAGE: ${{ env.APP_IMAGE }}:dev-${{ github.sha }}
+          TLS_ISSUER: ${{ vars.TLS_ISSUER }}
+        run: |
+          set -euo pipefail
+          # El runner self-hosted ya trae `envsubst` (mismo uso que recetas);
+          # si faltara, se falla con un mensaje claro en vez de aplicar un
+          # manifiesto con placeholders literales.
+          if ! command -v envsubst >/dev/null; then
+            echo "::error::falta envsubst (gettext-base) en el runner self-hosted"
+            exit 1
+          fi
+          export NS HYPERFRAMES_HOST="$HOST" HYPERFRAMES_IMAGE TLS_ISSUER
+          envsubst '${NS} ${HYPERFRAMES_IMAGE} ${HYPERFRAMES_HOST} ${TLS_ISSUER}' \
+            < k8s/hyperframes.yaml | kubectl apply -f -
+          kubectl -n "$NS" rollout status deployment/hyperframes --timeout=600s
+          kubectl -n "$NS" get deploy hyperframes -o wide
+          kubectl -n "$NS" get pods -l app=hyperframes -o wide
+
+      # Certificado DNS-01 + primer arranque de Chrome pueden tardar minutos:
+      # se reintenta sin -k, así el paso falla si el TLS no es válido.
+      - name: Smoke HTTPS (200 y TLS válido)
+        env:
+          HOST: ${{ steps.env.outputs.host }}
+        run: |
+          set -uo pipefail
+          ok=0; code=""
+          for i in $(seq 1 24); do
+            code="$(curl -sS -o /tmp/hf-smoke.html -w '%{http_code}' --max-time 10 "https://$HOST/" || true)"
+            if [ "$code" = "200" ] && grep -qi 'hyperframes' /tmp/hf-smoke.html; then ok=1; break; fi
+            echo "intento $i/24: HTTP ${code:-error}; esperando TLS/rollout…"
+            sleep 15
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::https://$HOST no responde 200 con el studio"
+            kubectl -n "${{ steps.env.outputs.ns }}" get pods -l app=hyperframes -o wide || true
+            exit 1
+          fi
+          echo "==> OK: https://$HOST HTTP 200 ($(wc -c </tmp/hf-smoke.html) B)"
+          echo | openssl s_client -servername "$HOST" -connect "$HOST:443" 2>/dev/null \
+            | openssl x509 -noout -issuer -subject -dates || true
