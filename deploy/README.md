@@ -69,6 +69,22 @@ Se mantiene el `node_modules` de producción para respetar el lockfile.
 - El demo carga GSAP desde `cdn.jsdelivr.net`; sin salida a internet el
   studio sigue cargando y el timeline del demo queda estático.
 
+## Render
+
+El render local (el que hace el productor: Chrome headless captura frames y
+ffmpeg codifica) funciona dentro de la imagen. Verificado en T-364 con el
+proyecto demo (10 s, 30 fps, 300 frames, `--quality draft`, 1 worker):
+
+```sh
+docker exec <contenedor> bun /app/packages/cli/bin/hyperframes.mjs render \
+  /data/project --output /data/render.mp4 --workers 1 --quality draft
+# → 130 KB · 10,0 s de vídeo · 7,7 s de render (software GPU)
+```
+
+Necesita **espacio en `/tmp`**: con los 512 Mi iniciales el CLI aborta con
+«Low disk space» antes de capturar. El manifiesto monta un emptyDir de 4 Gi en
+`/tmp` y 1 Gi en `/dev/shm`. El MP4 se escribe en `/data` (emptyDir de 2 Gi).
+
 ## Qué NO soporta este contenedor
 
 - **Autenticación**: el studio no tiene auth propia y su API permite leer y

@@ -106,10 +106,13 @@ spec:
         - name: data
           emptyDir: { sizeLimit: 2Gi }
         - name: tmp
-          emptyDir: { sizeLimit: 512Mi }
+          # T-364: el render escribe frames y temporales en /tmp. Con 512Mi el
+          # CLI aborta con «Low disk space» antes de capturar (probado con un
+          # render draft de 10 s/300 frames). 4Gi cubre ese caso con margen.
+          emptyDir: { sizeLimit: 4Gi }
         # Chrome usa /dev/shm; el default de 64 MB hace fallar capturas grandes.
         - name: dshm
-          emptyDir: { medium: Memory, sizeLimit: 512Mi }
+          emptyDir: { medium: Memory, sizeLimit: 1Gi }
 ---
 apiVersion: v1
 kind: Service
